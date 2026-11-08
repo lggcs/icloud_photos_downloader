@@ -38,8 +38,8 @@ def convert_heic_to_jpeg(logger: logging.Logger, source_path: str) -> str | None
 
     Returns the JPEG path on success, or None with the source kept on any
     failure. The JPEG carries over the EXIF metadata (with the orientation
-    baked into the pixels and removed from the tags) and the color profile,
-    and keeps the source's modification time.
+    baked into the pixels and removed from the tags), the color profile and
+    the XMP metadata, and keeps the source's modification time.
     """
     try:
         from PIL import Image, ImageOps
@@ -55,6 +55,7 @@ def convert_heic_to_jpeg(logger: logging.Logger, source_path: str) -> str | None
         with Image.open(source_path) as image:
             exif_bytes = _drop_orientation(image.info.get("exif"))
             icc_profile = image.info.get("icc_profile")
+            xmp_bytes = image.info.get("xmp")
             transposed = ImageOps.exif_transpose(image)
         if transposed.mode not in ("RGB", "L"):
             transposed = transposed.convert("RGB")
@@ -67,6 +68,8 @@ def convert_heic_to_jpeg(logger: logging.Logger, source_path: str) -> str | None
             save_kwargs["exif"] = exif_bytes
         if icc_profile:
             save_kwargs["icc_profile"] = icc_profile
+        if xmp_bytes:
+            save_kwargs["xmp"] = xmp_bytes
         transposed.save(temporary_path, "JPEG", **save_kwargs)
         transposed.close()
         with Image.open(temporary_path) as check:

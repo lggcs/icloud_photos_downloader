@@ -97,6 +97,33 @@ def test_preserves_exif_date_and_color_profile(tmp_path: Path) -> None:
         assert jpeg.info.get("icc_profile") == b"fake-icc-profile"
 
 
+def test_preserves_xmp_and_gps_metadata(tmp_path: Path) -> None:
+    xmp_packet = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        b"<rdf:Description/></rdf:RDF></x:xmpmeta>"
+    )
+    exif_dict: dict[str, Any] = {
+        "0th": {},
+        "Exif": {},
+        "GPS": {
+            piexif.GPSIFD.GPSLatitudeRef: b"N",
+            piexif.GPSIFD.GPSLatitude: ((40, 1), (26, 1), (45, 1)),
+        },
+    }
+    source = tmp_path / "IMG_4028.HEIC"
+    Image.new("RGB", (40, 30), (200, 60, 60)).save(
+        str(source), "HEIF", exif=piexif.dump(exif_dict), xmp=xmp_packet
+    )
+    result = convert_heic_to_jpeg(LOGGER, str(source))
+    assert result is not None
+    with Image.open(result) as jpeg:
+        assert jpeg.info.get("xmp") == xmp_packet
+        gps = piexif.load(jpeg.info.get("exif", b""))["GPS"]
+        assert gps[piexif.GPSIFD.GPSLatitudeRef] == b"N"
+        assert gps[piexif.GPSIFD.GPSLatitude] == ((40, 1), (26, 1), (45, 1))
+
+
 def test_preserves_source_mtime(tmp_path: Path) -> None:
     source = make_heic(tmp_path / "IMG_4025.HEIC")
     stamp = 1_700_000_000.0
