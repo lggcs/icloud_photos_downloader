@@ -33,6 +33,10 @@ class _DefaultConfig:
     auto_delete: bool
     prune_orphans: bool = False
     prune_orphans_adopt_existing: bool = False
+    sync_manifest: bool = False
+    convert_to_jpeg: bool = False
+    verify: bool = False
+    verify_checksums: bool = False
     folder_structure: str
     set_exif_datetime: bool
     smtp_username: str | None

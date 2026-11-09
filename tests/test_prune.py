@@ -20,6 +20,7 @@ from icloudpd.cli import parse
 from icloudpd.counter import Counter
 from icloudpd.prune import PruneSnapshot, file_record, library_photo_ids, lock_file
 from icloudpd.status import StatusExchange
+from icloudpd.sync_manifest import SyncManifest
 from pyicloud_ipd.asset_version import AssetVersion
 from pyicloud_ipd.base import PyiCloudService
 from pyicloud_ipd.file_match import FileMatchPolicy
@@ -507,7 +508,14 @@ def run_shared_download(
 def downloader_for(
     tmp_path: Path,
 ) -> Callable[[PyiCloudService, Counter, PhotoAsset], DownloadResult]:
-    def download(_icloud: PyiCloudService, _counter: Counter, item: PhotoAsset) -> DownloadResult:
+    def download(
+        _icloud: PyiCloudService,
+        _counter: Counter,
+        item: PhotoAsset,
+        *,
+        sync_manifest: SyncManifest | None = None,
+        convert_to_jpeg: bool = False,
+    ) -> DownloadResult:
         target = tmp_path / f"{item.id}.JPG"
         if target.exists():
             return DownloadResult(False, True)

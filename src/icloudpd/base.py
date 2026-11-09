@@ -3,10 +3,12 @@
 
 import datetime
 import getpass
+import hashlib
 import itertools
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -44,6 +46,7 @@ from icloudpd import download, exif_datetime
 from icloudpd.authentication import authenticator
 from icloudpd.autodelete import autodelete_photos
 from icloudpd.config import GlobalConfig, UserConfig
+from icloudpd.convert import convert_heic_to_jpeg, is_heic
 from icloudpd.counter import Counter
 from icloudpd.email_notifications import send_2sa_notification
 from icloudpd.filename_policies import build_filename_with_policies, create_filename_builder
@@ -55,6 +58,7 @@ from icloudpd.prune import PruneSnapshot
 from icloudpd.server import serve_app
 from icloudpd.status import Status, StatusExchange
 from icloudpd.string_helpers import parse_timestamp_or_timedelta, truncate_middle
+from icloudpd.sync_manifest import SyncManifest
 from icloudpd.xmp_sidecar import generate_xmp_file
 from pyicloud_ipd.asset_version import add_suffix_to_filename, calculate_version_filename
 from pyicloud_ipd.base import PyiCloudService
@@ -436,7 +440,7 @@ def _process_all_users_once(
                     user_config.align_raw,
                 )
                 if user_config.directory is not None
-                else (lambda _s, _c, _p: NOT_DOWNLOADED)
+                else (lambda _s, _c, _p, **_k: NOT_DOWNLOADED)
             )
 
             notificator = partial(
@@ -606,6 +610,8 @@ class DownloadResult(NamedTuple):
     """every requested file is on disk now, downloaded earlier or in this run"""
     created_paths: tuple[str, ...] = ()
     expected_paths: tuple[str, ...] = ()
+    inspected_versions: tuple[tuple[str, str, int], ...] = ()
+    """with inspect_only: (local path, remote checksum, remote size) per expected file"""
 
 
 NOT_DOWNLOADED = DownloadResult(downloaded=False, present=False)
@@ -632,6 +638,8 @@ def download_builder(
     photo: PhotoAsset,
     *,
     inspect_only: bool = False,
+    sync_manifest: SyncManifest | None = None,
+    convert_to_jpeg: bool = False,
 ) -> DownloadResult:
     """Download files, or inspect their selected paths without writing or fetching media."""
 
@@ -693,6 +701,7 @@ def download_builder(
     success = False
     created_paths: list[str] = []
     expected_paths: list[str] = []
+    inspected_versions: list[tuple[str, str, int]] = []
     # nothing is written in --only-print-filenames mode
     present = not only_print_filenames and not inspect_only
 
@@ -726,6 +735,7 @@ def download_builder(
         download_path = local_download_path(filename, download_dir)
 
         if inspect_only:
+            inspected_versions.append((download_path, version.checksum, version.size))
             expected_paths.append(download_path)
             if download_size == AssetVersionSize.ORIGINAL:
                 expected_paths.append(add_suffix_to_filename("-original", download_path))
@@ -741,34 +751,71 @@ def download_builder(
             original_download_path = add_suffix_to_filename("-original", download_path)
             file_exists = os.path.isfile(original_download_path)
 
-        if file_exists:
-            if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
-                # for later: this crashes if download-size medium is specified
-                file_size = os.stat(original_download_path or download_path).st_size
-                photo_size = version.size
-                if file_size != photo_size and not (
+        if file_exists and file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
+            # for later: this crashes if download-size medium is specified
+            file_size = os.stat(original_download_path or download_path).st_size
+            photo_size = version.size
+            if file_size != photo_size and not (
+                set_exif_datetime
+                and exif_datetime.has_own_exif_date(
+                    logger,
+                    original_download_path or download_path,
+                    created_date.strftime("%Y:%m:%d %H:%M:%S"),
+                    file_size,
+                    photo_size,
+                )
+            ):
+                download_path = (f"-{photo_size}.").join(download_path.rsplit(".", 1))
+                original_download_path = None
+                logger.debug("%s deduplicated", truncate_middle(download_path, 96))
+                file_exists = os.path.isfile(download_path)
+
+        manifest_hit = (
+            sync_manifest.find_representation(photo.id, download_path, version.checksum)
+            if sync_manifest is not None and not inspect_only
+            else None
+        )
+        if manifest_hit is not None:
+            counter.increment()
+            logger.debug("%s already in sync manifest", truncate_middle(download_path, 96))
+            expected_paths.append(os.path.join(directory, manifest_hit.rel_path))
+        elif file_exists:
+            counter.increment()
+            logger.debug("%s already exists", truncate_middle(download_path, 96))
+            if sync_manifest is not None and not only_print_filenames:
+                existing_path = original_download_path or download_path
+                existing_size = os.stat(existing_path).st_size
+                size_matches = existing_size == version.size or (
                     set_exif_datetime
                     and exif_datetime.has_own_exif_date(
                         logger,
-                        original_download_path or download_path,
+                        existing_path,
                         created_date.strftime("%Y:%m:%d %H:%M:%S"),
-                        file_size,
-                        photo_size,
+                        existing_size,
+                        version.size,
                     )
-                ):
-                    download_path = (f"-{photo_size}.").join(download_path.rsplit(".", 1))
-                    original_download_path = None
-                    logger.debug("%s deduplicated", truncate_middle(download_path, 96))
-                    file_exists = os.path.isfile(download_path)
-            if file_exists:
-                counter.increment()
-                logger.debug("%s already exists", truncate_middle(download_path, 96))
+                )
+                if size_matches:
+                    if (
+                        convert_to_jpeg
+                        and photo.item_type == AssetItemType.IMAGE
+                        and is_heic(existing_path)
+                    ):
+                        converted_path = convert_heic_to_jpeg(logger, existing_path)
+                        if converted_path is None:
+                            sync_manifest.adopt(photo.id, existing_path, version.checksum)
+                        else:
+                            sync_manifest.record(
+                                photo.id, converted_path, version.checksum, converted=True
+                            )
+                    else:
+                        sync_manifest.adopt(photo.id, existing_path, version.checksum)
 
         expected_paths.append(
             original_download_path if file_exists and original_download_path else download_path
         )
 
-        if not file_exists and not inspect_only:
+        if not file_exists and manifest_hit is None and not inspect_only:
             counter.reset()
             if only_print_filenames:
                 print(download_path)
@@ -795,10 +842,23 @@ def download_builder(
 
                     is_jpeg = compose(endswith((".jpg", ".jpeg")), lower)
 
+                    converted = False
+                    if (
+                        not dry_run
+                        and convert_to_jpeg
+                        and photo.item_type == AssetItemType.IMAGE
+                        and is_heic(download_path)
+                    ):
+                        converted_path = convert_heic_to_jpeg(logger, download_path)
+                        if converted_path is not None:
+                            download_path = converted_path
+                            truncated_path = truncate_middle(download_path, 96)
+                            converted = True
+
                     if (
                         not dry_run
                         and set_exif_datetime
-                        and is_jpeg(filename)
+                        and (is_jpeg(filename) or converted)
                         and not exif_datetime.get_photo_exif(logger, download_path)
                     ):
                         # %Y:%m:%d looks wrong, but it's the correct format
@@ -814,6 +874,10 @@ def download_builder(
                     logger.info("Downloaded %s", truncated_path)
                     if not dry_run:
                         created_paths.append(download_path)
+                        if sync_manifest is not None:
+                            sync_manifest.record(
+                                photo.id, download_path, version.checksum, converted=converted
+                            )
 
         if xmp_sidecar and not only_print_filenames:
             expected_paths.append(download_path + ".xmp")
@@ -848,6 +912,7 @@ def download_builder(
             lp_download_path = os.path.join(download_dir, lp_filename)
 
             if inspect_only:
+                inspected_versions.append((lp_download_path, version.checksum, version.size))
                 expected_paths.append(lp_download_path)
                 if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
                     expected_paths.append(
@@ -886,7 +951,23 @@ def download_builder(
                             lp_file_exists = os.path.isfile(lp_download_path)
                     if lp_file_exists:
                         logger.debug("%s already exists", truncate_middle(lp_download_path, 96))
-                if not lp_file_exists and not inspect_only:
+                lp_manifest_hit = (
+                    sync_manifest.find_representation(photo.id, lp_download_path, version.checksum)
+                    if sync_manifest is not None
+                    else None
+                )
+                if lp_manifest_hit is not None:
+                    logger.debug(
+                        "%s already in sync manifest", truncate_middle(lp_download_path, 96)
+                    )
+                elif (
+                    lp_file_exists
+                    and sync_manifest is not None
+                    and not only_print_filenames
+                    and os.path.getsize(lp_download_path) == version.size
+                ):
+                    sync_manifest.adopt(photo.id, lp_download_path, version.checksum)
+                if not lp_file_exists and lp_manifest_hit is None and not inspect_only:
                     truncated_path = truncate_middle(lp_download_path, 96)
                     logger.debug("Downloading %s...", truncated_path)
                     download_result = download.download_media(
@@ -905,6 +986,8 @@ def download_builder(
                         logger.info("Downloaded %s", truncated_path)
                         if not dry_run:
                             created_paths.append(lp_download_path)
+                            if sync_manifest is not None:
+                                sync_manifest.record(photo.id, lp_download_path, version.checksum)
                 expected_paths.append(lp_download_path)
         elif any(isinstance(size, LivePhotoVersionSize) for size in photo_versions_with_policy):
             # a live photo without the requested video size: the video is not kept locally
@@ -914,6 +997,7 @@ def download_builder(
         present=present,
         created_paths=tuple(created_paths),
         expected_paths=tuple(dict.fromkeys(expected_paths)),
+        inspected_versions=tuple(inspected_versions),
     )
 
 
@@ -996,6 +1080,80 @@ def asset_type_skip_message(
     return f"Skipping {filename}, only downloading {photo_video_phrase}. (Item type was: {photo.item_type})"
 
 
+def verify_mirror(
+    logger: logging.Logger,
+    directory: str,
+    verify_checksums: bool,
+    manifest: SyncManifest | None,
+    library: PhotoLibrary,
+    passer: Callable[[PhotoAsset], bool],
+    inspect_asset: Callable[[PhotoAsset], DownloadResult],
+) -> int:
+    """Audit the local mirror without downloading; 0 when everything is in sync."""
+
+    def local_sha256(path: str) -> str:
+        with open(path, "rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+
+    ok_count = 0
+    problems = 0
+    for item in library.all:
+        if not passer(item):
+            continue
+        for inspected_path, checksum, size in inspect_asset(item).inspected_versions:
+            rows = manifest.lookup(item.id) if manifest is not None else []
+            relative = os.path.relpath(inspected_path, directory)
+            row = next((r for r in rows if r.rel_path == relative), None)
+            if row is None:
+                row = next(
+                    (r for r in rows if r.state == "converted" and r.remote_checksum == checksum),
+                    None,
+                )
+            if row is None:
+                if os.path.isfile(inspected_path):
+                    logger.error(
+                        "%s is not recorded in the sync manifest",
+                        truncate_middle(inspected_path, 96),
+                    )
+                else:
+                    logger.error("%s is not downloaded", truncate_middle(inspected_path, 96))
+                problems += 1
+                continue
+            local_path = os.path.join(directory, row.rel_path)
+            if not os.path.isfile(local_path):
+                logger.error("%s is missing", truncate_middle(local_path, 96))
+                problems += 1
+            elif os.path.getsize(local_path) != row.size or (
+                verify_checksums
+                and row.sha256 is not None
+                and local_sha256(local_path) != row.sha256
+            ):
+                logger.error("%s has changed since download", truncate_middle(local_path, 96))
+                problems += 1
+            elif row.remote_checksum != checksum:
+                logger.error(
+                    "%s is outdated: a newer version exists in iCloud",
+                    truncate_middle(local_path, 96),
+                )
+                problems += 1
+            else:
+                if row.state == "adopted" and row.size != size:
+                    logger.warning(
+                        "%s was adopted without verification; its size does not match iCloud",
+                        truncate_middle(local_path, 96),
+                    )
+                ok_count += 1
+    if problems:
+        logger.error(
+            "Sync verification found %d problem(s) in %d file(s)",
+            problems,
+            ok_count + problems,
+        )
+        return 1
+    logger.info("Sync verification: %d file(s) are up to date", ok_count)
+    return 0
+
+
 def core_single_run(
     logger: logging.Logger,
     status_exchange: StatusExchange,
@@ -1005,7 +1163,7 @@ def core_single_run(
         PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
     ],
     passer: Callable[[PhotoAsset], bool],
-    downloader: Callable[[PyiCloudService, Counter, PhotoAsset], DownloadResult],
+    downloader: Callable[..., DownloadResult],
     notificator: Callable[[], None],
     lp_filename_generator: Callable[[str], str],
 ) -> int:
@@ -1019,6 +1177,7 @@ def core_single_run(
     listing_incomplete = False
     while True:  # retry loop (not watch - only for immediate retries)
         prune_snapshot: PruneSnapshot | None = None
+        sync_manifest: SyncManifest | None = None
         captured_responses: List[Mapping[str, Any]] = []
 
         def append_response(captured: List[Mapping[str, Any]], response: Mapping[str, Any]) -> None:
@@ -1088,6 +1247,87 @@ def core_single_run(
 
                     directory = os.path.normpath(user_config.directory)
 
+                    if user_config.sync_manifest:
+                        try:
+                            scope = json.dumps(
+                                {
+                                    "account": user_config.username.casefold(),
+                                    "domain": global_config.domain,
+                                    "zone": library_object.zone_id,
+                                    "timezone": str(get_localzone()),
+                                    "settings": {
+                                        name: str(getattr(user_config, name))
+                                        for name in (
+                                            "sizes",
+                                            "force_size",
+                                            "folder_structure",
+                                            "xmp_sidecar",
+                                            "skip_live_photos",
+                                            "live_photo_size",
+                                            "live_photo_mov_filename_policy",
+                                            "align_raw",
+                                            "file_match_policy",
+                                            "keep_unicode_in_filenames",
+                                            "set_exif_datetime",
+                                            "convert_to_jpeg",
+                                        )
+                                    },
+                                },
+                                sort_keys=True,
+                            )
+                            sync_manifest = SyncManifest(
+                                directory,
+                                scope,
+                                user_config.dry_run
+                                or user_config.verify
+                                or global_config.only_print_filenames,
+                            )
+                        except (OSError, ValueError, sqlite3.DatabaseError) as error:
+                            logger.error("Cannot use the sync manifest: %s", error)
+                            return 1
+
+                    def inspect_asset(
+                        item: PhotoAsset,
+                        *,
+                        destination: str = directory,
+                        service: PyiCloudService = icloud,
+                    ) -> DownloadResult:
+                        return download_builder(
+                            logger=logger,
+                            folder_structure=user_config.folder_structure,
+                            directory=destination,
+                            primary_sizes=user_config.sizes,
+                            force_size=user_config.force_size,
+                            only_print_filenames=False,
+                            set_exif_datetime=user_config.set_exif_datetime,
+                            skip_live_photos=user_config.skip_live_photos,
+                            live_photo_size=user_config.live_photo_size,
+                            dry_run=True,
+                            file_match_policy=user_config.file_match_policy,
+                            xmp_sidecar=user_config.xmp_sidecar,
+                            lp_filename_generator=lp_filename_generator,
+                            filename_builder=create_filename_builder(
+                                user_config.file_match_policy,
+                                build_filename_cleaner(user_config.keep_unicode_in_filenames),
+                            ),
+                            raw_policy=user_config.align_raw,
+                            icloud=service,
+                            counter=Counter(),
+                            photo=item,
+                            inspect_only=True,
+                        )
+
+                    if user_config.verify:
+                        return verify_mirror(
+                            logger,
+                            directory,
+                            user_config.verify_checksums,
+                            sync_manifest,
+                            library_object,
+                            passer,
+                            inspect_asset,
+                        )
+
                     if user_config.prune_orphans:
                         if library_object.library_type != "shared":
                             logger.warning(
@@ -1127,6 +1367,8 @@ def core_single_run(
                                 logger.warning("Skipping orphan pruning: %s", error)
                                 logger.debug("Orphan-pruning setup failed", exc_info=True)
                     prune_complete = True
+                    manifest_complete = True
+                    listed_ids: set[str] = set()
 
                     if user_config.skip_photos or user_config.skip_videos:
                         photo_video_phrase = "photos" if user_config.skip_videos else "videos"
@@ -1235,7 +1477,12 @@ def core_single_run(
                         now = datetime.datetime.now(get_localzone())
                         # photos_iterator = iter(photos_enumerator)
 
-                        download_photo = partial(downloader, icloud)
+                        download_photo = partial(
+                            downloader,
+                            icloud,
+                            sync_manifest=sync_manifest,
+                            convert_to_jpeg=user_config.convert_to_jpeg,
+                        )
 
                         for item in photos_bar:
                             try:
@@ -1247,6 +1494,7 @@ def core_single_run(
                                     break
                                 # item = next(photos_iterator)
                                 should_delete = False
+                                listed_ids.add(item.id)
 
                                 passer_result = passer(item)
                                 download_result = (
@@ -1373,12 +1621,14 @@ def core_single_run(
                         )
                         if status_exchange.get_progress().cancel:
                             prune_complete = False
+                            manifest_complete = False
                             logger.info("Iteration was cancelled")
                             status_exchange.get_progress().photos_last_message = (
                                 "Iteration was cancelled"
                             )
                         elif listed_everything and photos_counter < album_size:
                             prune_complete = False
+                            manifest_complete = False
                             listing_incomplete = True
                             where = f"album {photo_album}" if str(photo_album) else "the library"
                             message = (
@@ -1400,6 +1650,23 @@ def core_single_run(
                             status_exchange.get_progress().photos_last_message = message
                         status_exchange.get_progress().reset()
 
+                    if (
+                        sync_manifest is not None
+                        and manifest_complete
+                        and listed_ids
+                        and not user_config.albums
+                        and user_config.recent is None
+                        and user_config.until_found is None
+                        and not user_config.dry_run
+                        and not global_config.only_print_filenames
+                    ):
+                        forgotten = sync_manifest.forget_absent(listed_ids)
+                        if forgotten > 0:
+                            logger.debug(
+                                "Sync manifest forgot %d asset(s) that left the library",
+                                forgotten,
+                            )
+
                     if prune_snapshot is not None:
                         if prune_complete:
                             try:
@@ -1410,31 +1677,8 @@ def core_single_run(
                                     destination: str = directory,
                                     service: PyiCloudService = icloud,
                                 ) -> tuple[str, ...]:
-                                    return download_builder(
-                                        logger=logger,
-                                        folder_structure=user_config.folder_structure,
-                                        directory=destination,
-                                        primary_sizes=user_config.sizes,
-                                        force_size=user_config.force_size,
-                                        only_print_filenames=False,
-                                        set_exif_datetime=user_config.set_exif_datetime,
-                                        skip_live_photos=user_config.skip_live_photos,
-                                        live_photo_size=user_config.live_photo_size,
-                                        dry_run=True,
-                                        file_match_policy=user_config.file_match_policy,
-                                        xmp_sidecar=user_config.xmp_sidecar,
-                                        lp_filename_generator=lp_filename_generator,
-                                        filename_builder=create_filename_builder(
-                                            user_config.file_match_policy,
-                                            build_filename_cleaner(
-                                                user_config.keep_unicode_in_filenames
-                                            ),
-                                        ),
-                                        raw_policy=user_config.align_raw,
-                                        icloud=service,
-                                        counter=Counter(),
-                                        photo=item,
-                                        inspect_only=True,
+                                    return inspect_asset(
+                                        item, destination=destination, service=service
                                     ).expected_paths
 
                                 prune_snapshot.finish(
@@ -1526,6 +1770,8 @@ def core_single_run(
                     prune_snapshot.close()
                 except OSError as error:
                     logger.warning("Cannot close orphan-pruning lock: %s", error)
+            if sync_manifest is not None:
+                sync_manifest.close()
 
         # In single run mode, we don't handle watch intervals - that's done at higher level
         break

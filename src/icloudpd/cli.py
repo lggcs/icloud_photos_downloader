@@ -151,6 +151,26 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         action="store_true",
     )
     cloned.add_argument(
+        "--sync-manifest",
+        help="Remember downloaded files in a SQLite manifest (`.icloudpd-sync.db` in the download directory), so re-runs skip unchanged files without re-downloading them, rsync-style. Requires a dedicated directory.",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--convert-to-jpeg",
+        help="Convert HEIC/HEIF photos to JPEG after downloading and remove the original file, so the backup contains no Mac-specific file types. Requires --sync-manifest.",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--verify",
+        help="Check the local files against the sync manifest and the iCloud listing without downloading anything; report discrepancies and exit with an error if the mirror is not up to date. Requires --sync-manifest.",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--verify-checksums",
+        help="With --verify, also compare SHA-256 checksums of local files, not only sizes",
+        action="store_true",
+    )
+    cloned.add_argument(
         "--folder-structure",
         help="Folder structure. If set to `none`, all photos will be placed into the download directory. Default: %(default)s",
         default="{:%Y/%m/%d}",
@@ -473,6 +493,10 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         auto_delete=user_ns.auto_delete,
         prune_orphans=user_ns.prune_orphans,
         prune_orphans_adopt_existing=user_ns.prune_orphans_adopt_existing,
+        sync_manifest=user_ns.sync_manifest,
+        convert_to_jpeg=user_ns.convert_to_jpeg,
+        verify=user_ns.verify,
+        verify_checksums=user_ns.verify_checksums,
         folder_structure=user_ns.folder_structure,
         set_exif_datetime=user_ns.set_exif_datetime,
         smtp_username=user_ns.smtp_username,
@@ -658,6 +682,40 @@ def cli() -> int:
             if first is not second
         ):
             print("--prune-orphans requires a dedicated, non-overlapping download directory")
+            return 2
+
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if (user_ns.verify or user_ns.convert_to_jpeg) and not user_ns.sync_manifest
+        ]:
+            print("--convert-to-jpeg and --verify require --sync-manifest")
+            return 2
+
+        elif [user_ns for user_ns in user_nses if user_ns.verify_checksums and not user_ns.verify]:
+            print("--verify-checksums requires --verify")
+            return 2
+
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if user_ns.verify
+            and (
+                user_ns.recent is not None
+                or user_ns.until_found is not None
+                or user_ns.albums
+                or user_ns.auto_delete
+                or user_ns.delete_after_download
+                or user_ns.keep_icloud_recent_days is not None
+                or global_ns.only_print_filenames
+                or global_ns.watch_with_interval is not None
+            )
+        ]:
+            print(
+                "--verify requires a full library check and cannot be combined with "
+                "--recent, --until-found, --album, --auto-delete, --delete-after-download, "
+                "--keep-icloud-recent-days, --only-print-filenames or --watch-with-interval"
+            )
             return 2
 
         elif [
