@@ -28,3 +28,4 @@ Opt-in support for resumable, bandwidth-friendly backups. icloudpd remembers eve
 - `--convert-to-jpeg` converts HEIC/HEIF photos to JPEG after downloading and removes the original, so the backup contains no Mac-specific file types; EXIF data, file modification time and XMP sidecars are preserved
 - `--verify` audits the local mirror against the manifest and the iCloud listing without downloading anything, reporting missing, changed or outdated files; `--verify-checksums` additionally compares SHA-256 checksums of the local files
 - The manifest is bound to the account, library and configuration; icloudpd refuses to reuse a manifest created with different settings
+- The interactive helper `icloudpd-tui` walks through this flow: it asks for the account and backup directory, offers backup and verify actions, and prints the exact icloudpd command it runs
