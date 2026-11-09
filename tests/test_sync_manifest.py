@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ SCOPE = '{"account": "jdoe@gmail.com", "settings": {"sizes": "original"}}'
 
 
 @pytest.fixture
-def manifest(tmp_path: Path) -> SyncManifest:
+def manifest(tmp_path: Path) -> Iterator[SyncManifest]:
     result = SyncManifest(str(tmp_path), SCOPE)
     try:
         yield result
