@@ -38,6 +38,7 @@ See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_dow
 - Automatic de-duplication of photos with the same name
 - One time download and an option to monitor for iCloud changes continuously (`--watch-with-interval` option)
 - Optimizations for incremental runs (`--until-found` and `--recent` options)
+- Incremental backups that re-download only missing or changed files (`--sync-manifest` option)
 - Photo metadata (EXIF) updates (`--set-exif-datetime` option)
 - ... and many more (use `--help` option to get full list)
 

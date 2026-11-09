@@ -491,6 +491,26 @@ This is a list of all options available for the command line interface (CLI) of 
     ```{versionadded} 1.25.0
     ```
 
+(sync-manifest-parameter)=
+`--sync-manifest`
+
+:   Remembers every downloaded file in a SQLite manifest (`.icloudpd-sync.db` in the download directory) and skips anything that is already in sync with iCloud, so repeated runs download only what is missing or changed. Files that already exist on disk before the first run are adopted into the manifest without downloading. Requires a dedicated download directory.
+
+(convert-to-jpeg-parameter)=
+`--convert-to-jpeg`
+
+:   Converts HEIC/HEIF photos to JPEG after downloading and removes the original file, so the backup contains no Mac-specific file types. EXIF data, file modification time and XMP sidecars are preserved. Requires `--sync-manifest`.
+
+(verify-parameter)=
+`--verify`
+
+:   Checks the local files against the sync manifest and the iCloud listing without downloading anything; missing, changed or outdated files are reported and the run exits with an error. Requires `--sync-manifest` and a full library check.
+
+(verify-checksums-parameter)=
+`--verify-checksums`
+
+:   Extends `--verify` to also compare the SHA-256 checksums of the local files. Requires `--verify`.
+
 (smtp-parameter)=
 `--smtp-username X`, `--smtp-password X`, `--smtp-host X`, `--smtp-port X`, `--smtp-no-tls`
     

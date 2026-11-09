@@ -18,3 +18,13 @@ Opt-in support for accounts with Advanced Data Protection (ADP). After signing i
 ## Security keys (FIDO)
 
 Sign in with a security key, see [FIDO](docs/authentication.md#fido). Only tested on Linux, see [#583](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues/583).
+
+## Rsync-style backup (`--sync-manifest`)
+
+Opt-in support for resumable, bandwidth-friendly backups. icloudpd remembers every downloaded file in a SQLite manifest (`.icloudpd-sync.db` in the download directory) and skips anything that is already in sync with iCloud, so repeated runs download only what is missing or changed.
+
+- Requires a dedicated download directory
+- Files that already exist on disk before the first run are adopted into the manifest without downloading
+- `--convert-to-jpeg` converts HEIC/HEIF photos to JPEG after downloading and removes the original, so the backup contains no Mac-specific file types; EXIF data, file modification time and XMP sidecars are preserved
+- `--verify` audits the local mirror against the manifest and the iCloud listing without downloading anything, reporting missing, changed or outdated files; `--verify-checksums` additionally compares SHA-256 checksums of the local files
+- The manifest is bound to the account, library and configuration; icloudpd refuses to reuse a manifest created with different settings
